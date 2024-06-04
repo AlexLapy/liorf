@@ -155,12 +155,18 @@ public:
 
     GeographicLib::LocalCartesian gps_trans_;
 
+
     // scancontext loop closure
     SCManager scManager;
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> br;
+    tf2_ros::Buffer tfBuffer;
+    tf2_ros::TransformListener tfListener;
 
-    mapOptimization(const rclcpp::NodeOptions & options) : ParamServer("liorf_mapOptimization", options)
+    mapOptimization(const rclcpp::NodeOptions & options) 
+    : ParamServer("liorf_mapOptimization", options),
+      tfBuffer(this->get_clock()),         
+      tfListener(tfBuffer)  
     {
         ISAM2Params parameters;
         parameters.relinearizeThreshold = 0.1;
@@ -1672,7 +1678,7 @@ public:
         nav_msgs::msg::Odometry laserOdometryROS;
         laserOdometryROS.header.stamp = timeLaserInfoStamp;
         laserOdometryROS.header.frame_id = odometryFrame;
-        laserOdometryROS.child_frame_id = "base_link";
+        laserOdometryROS.child_frame_id = "rslidar_base_link";
         laserOdometryROS.pose.pose.position.x = transformTobeMapped[3];
         laserOdometryROS.pose.pose.position.y = transformTobeMapped[4];
         laserOdometryROS.pose.pose.position.z = transformTobeMapped[5];
@@ -1684,15 +1690,38 @@ public:
         laserOdometryROS.pose.pose.orientation = quat_msg;
         pubLaserOdometryGlobal->publish(laserOdometryROS);
         
-        // Publish TF
-        quat_tf.setRPY(transformTobeMapped[0], transformTobeMapped[1], transformTobeMapped[2]);
-        tf2::Transform t_odom_to_lidar = tf2::Transform(quat_tf, tf2::Vector3(transformTobeMapped[3], transformTobeMapped[4], transformTobeMapped[5]));
-        tf2::TimePoint time_point = tf2_ros::fromRclcpp(timeLaserInfoStamp);
-        tf2::Stamped<tf2::Transform> temp_odom_to_lidar(t_odom_to_lidar, time_point, odometryFrame);
-        geometry_msgs::msg::TransformStamped trans_odom_to_lidar;
-        tf2::convert(temp_odom_to_lidar, trans_odom_to_lidar);
-        trans_odom_to_lidar.child_frame_id = "base_link";
-        br->sendTransform(trans_odom_to_lidar);
+        try {
+            // Look up the transform from rslidar_base_link to base_link
+            geometry_msgs::msg::TransformStamped lidar_to_base_link = tfBuffer.lookupTransform("rslidar_base_link", "base_link", tf2::TimePointZero);
+
+            // Publish TF between odom and rslidar_base_link (as before)
+            tf2::Quaternion quat_tf;
+            quat_tf.setRPY(transformTobeMapped[0], transformTobeMapped[1], transformTobeMapped[2]);
+            tf2::Transform t_odom_to_lidar = tf2::Transform(quat_tf, tf2::Vector3(transformTobeMapped[3], transformTobeMapped[4], transformTobeMapped[5]));
+            tf2::TimePoint time_point = tf2_ros::fromRclcpp(timeLaserInfoStamp);
+            tf2::Stamped<tf2::Transform> temp_odom_to_lidar(t_odom_to_lidar, time_point, odometryFrame);
+            geometry_msgs::msg::TransformStamped trans_odom_to_lidar;
+            tf2::convert(temp_odom_to_lidar, trans_odom_to_lidar);
+
+            // Convert the lidar to base_link transform to tf2 format
+            tf2::Transform t_lidar_to_base_link;
+            tf2::fromMsg(lidar_to_base_link.transform, t_lidar_to_base_link);
+
+            // Combine the transforms: odom -> rslidar_base_link -> base_link
+            tf2::Transform t_odom_to_base_link = t_odom_to_lidar * t_lidar_to_base_link;
+
+            // Create and publish the combined transform
+            tf2::Stamped<tf2::Transform> temp_odom_to_base_link(t_odom_to_base_link, time_point, odometryFrame);
+            geometry_msgs::msg::TransformStamped trans_odom_to_base_link;
+            tf2::convert(temp_odom_to_base_link, trans_odom_to_base_link);
+            trans_odom_to_base_link.child_frame_id = "base_link";
+
+            // Publishing transform from odom to base_link
+            br->sendTransform(trans_odom_to_base_link);
+
+        } catch (tf2::TransformException &ex) {
+            RCLCPP_WARN(this->get_logger(), "Could not transform rslidar_base_link to base_link: %s", ex.what());
+        }
 
         // Publish odometry for ROS (incremental)
         static bool lastIncreOdomPubFlag = false;
@@ -1732,7 +1761,7 @@ public:
             }
             laserOdomIncremental.header.stamp = timeLaserInfoStamp;
             laserOdomIncremental.header.frame_id = odometryFrame;
-            laserOdomIncremental.child_frame_id = "base_link";
+            laserOdomIncremental.child_frame_id = "rslidar_base_link";
             laserOdomIncremental.pose.pose.position.x = x;
             laserOdomIncremental.pose.pose.position.y = y;
             laserOdomIncremental.pose.pose.position.z = z;
